@@ -2,6 +2,7 @@ package com.hmdp.service.impl;
 
 import com.hmdp.dto.Result;
 import com.hmdp.entity.SeckillVoucher;
+import com.hmdp.entity.Voucher;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
@@ -11,6 +12,8 @@ import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
 import lombok.val;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -18,9 +21,11 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
 import java.time.LocalDateTime;
 import java.util.Collections;
+import java.util.concurrent.*;
 
 /**
  * <p>
@@ -38,6 +43,43 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private RedisIdWorker redisIdWorker;
     private StringRedisTemplate stringRedisTemplate;
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+    private BlockingQueue<VoucherOrder> blockingQueue=new ArrayBlockingQueue<>(1024*1024);
+    private  static final ExecutorService SECKILL_ORDER_EXECUTOR= Executors.newSingleThreadExecutor();
+    private RedissonClient redissonClient;
+    IVoucherOrderService proxy;
+    @PostConstruct
+    private  void init(){
+        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandle());
+    }
+    private class VoucherOrderHandle implements Runnable{
+
+        @Override
+        public void run() {
+            while(true){
+                try {
+                    VoucherOrder voucherOrder = blockingQueue.take();
+                    handleVoucherOrder(voucherOrder);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+
+            }
+        }
+    }
+
+    private void handleVoucherOrder(VoucherOrder voucherOrder) {
+        Long userId= voucherOrder.getUserId();
+        Long voucherId=voucherOrder.getId();
+        RLock lock=redissonClient.getLock("lock:order:"+userId);
+        boolean islock=lock.tryLock();
+
+        boolean success = seckillVoucherService.update()
+                .setSql("stock=stock-1")
+                .eq("voucher_id", voucherId).gt("stock",0)
+                .update();
+        save(voucherOrder);
+    }
+
     static {
         SECKILL_SCRIPT=new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
@@ -45,6 +87,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
     @Override
     public Result seckillVoucher(Long voucherId) {
+        Long userId=UserHolder.getUser().getId();
         //异步秒杀
         Long result = stringRedisTemplate.execute(SECKILL_SCRIPT,
                 Collections.emptyList(), voucherId.toString(),
@@ -55,7 +98,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
         long orderId = redisIdWorker.nextId("order");
         //TODO 保存阻塞队列
-
+        VoucherOrder voucherOrder=new VoucherOrder();
+        voucherOrder.setId(orderId);
+        voucherOrder.setUserId(userId);
+        voucherOrder.setVoucherId(voucherId);
+        blockingQueue.add(voucherOrder);
+        proxy= (IVoucherOrderService) AopContext.currentProxy();
         //3. 返回订单id
         return Result.ok(orderId);
 
